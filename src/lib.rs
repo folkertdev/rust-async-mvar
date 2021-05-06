@@ -1,5 +1,10 @@
 #![no_std]
 
+/// # Asynchronous mutable variable
+///
+/// Based on haskell's [Control.Concurrent.MVar](https://hackage.haskell.org/package/base-4.15.0.0/docs/Control-Concurrent-MVar.html). Per its documentation:
+///
+/// > An `MVar t` is mutable location that is either empty or contains a value of type `t`. It has two fundamental operations: `putMVar` which fills an MVar if it is empty and blocks otherwise, and `takeMVar` which empties an MVar if it is full and blocks otherwise.
 use core::future::Future;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
@@ -71,8 +76,6 @@ impl<T> MVar<T> {
 
             self.state.store(MVAR_EMPTY, Ordering::SeqCst);
 
-            self.put_waker.wake();
-
             unsafe { Some(value.assume_init()) }
         } else {
             None
@@ -89,10 +92,16 @@ impl<'a, T> Future for TakeFuture<'a, T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> Poll<Self::Output> {
+        // register before the computation
         self.mvar.take_waker.register(cx.waker());
 
         match self.mvar._take() {
-            Some(value) => Poll::Ready(value),
+            Some(value) => {
+                // wake after the computation
+                self.mvar.put_waker.wake();
+
+                Poll::Ready(value)
+            }
             None => Poll::Pending,
         }
     }
@@ -108,6 +117,7 @@ impl<'a, T: Unpin> Future for PutFuture<'a, T> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> Poll<Self::Output> {
+        // register before the computation
         self.mvar.put_waker.register(cx.waker());
 
         let can_put = self.mvar.state.compare_exchange(
@@ -131,6 +141,8 @@ impl<'a, T: Unpin> Future for PutFuture<'a, T> {
                         .with_mut(|ptr| core::mem::swap(unsafe { &mut *ptr }, &mut muvalue));
 
                     reference.mvar.state.store(MVAR_FULL, Ordering::SeqCst);
+
+                    // wake after the computation
                     reference.mvar.take_waker.wake();
                 }
                 None => {
