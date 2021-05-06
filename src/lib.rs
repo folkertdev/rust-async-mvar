@@ -7,12 +7,18 @@ use core::sync::atomic::Ordering;
 use core::task::Poll;
 use futures::task::AtomicWaker;
 
-pub(crate) use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicU8;
+
+// (empty, filling, emptying, full)
+const MVAR_EMPTY: u8 = 1;
+const MVAR_FILLING: u8 = 2;
+const MVAR_EMPTYING: u8 = 4;
+const MVAR_FULL: u8 = 8;
 
 #[derive(Debug)]
 pub struct MVar<T> {
     item: UnsafeCell<MaybeUninit<T>>,
-    is_full: AtomicBool,
+    state: AtomicU8,
     take_waker: AtomicWaker,
     put_waker: AtomicWaker,
 }
@@ -23,7 +29,7 @@ impl<T> MVar<T> {
     pub const fn new_empty() -> Self {
         Self {
             item: UnsafeCell::new(MaybeUninit::uninit()),
-            is_full: AtomicBool::new(false),
+            state: AtomicU8::new(MVAR_EMPTY),
             take_waker: AtomicWaker::new(),
             put_waker: AtomicWaker::new(),
         }
@@ -32,7 +38,7 @@ impl<T> MVar<T> {
     pub const fn new(item: T) -> Self {
         Self {
             item: UnsafeCell::new(MaybeUninit::new(item)),
-            is_full: AtomicBool::new(true),
+            state: AtomicU8::new(MVAR_FULL),
             take_waker: AtomicWaker::new(),
             put_waker: AtomicWaker::new(),
         }
@@ -50,17 +56,22 @@ impl<T> MVar<T> {
     }
 
     fn _take(&self) -> Option<T> {
-        let can_take =
-            self.is_full
-                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
+        let can_take = self.state.compare_exchange(
+            MVAR_FULL,
+            MVAR_EMPTYING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
 
-        if let Ok(true) = can_take {
-            self.put_waker.wake();
-
+        if let Ok(MVAR_FULL) = can_take {
             let mut value = MaybeUninit::uninit();
 
             self.item
                 .with_mut(|ptr| core::mem::swap(unsafe { &mut *ptr }, &mut value));
+
+            self.state.store(MVAR_EMPTY, Ordering::SeqCst);
+
+            self.put_waker.wake();
 
             unsafe { Some(value.assume_init()) }
         } else {
@@ -99,17 +110,17 @@ impl<'a, T: Unpin> Future for PutFuture<'a, T> {
     fn poll(self: Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> Poll<Self::Output> {
         self.mvar.put_waker.register(cx.waker());
 
-        if let Ok(false) =
-            self.mvar
-                .is_full
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        {
+        let can_put = self.mvar.state.compare_exchange(
+            MVAR_EMPTY,
+            MVAR_FILLING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+
+        if let Ok(MVAR_EMPTY) = can_put {
             let reference = Pin::into_inner(self);
-            reference.mvar.take_waker.wake();
 
-            let mut opt_value = None;
-
-            core::mem::swap(&mut reference.item, &mut opt_value);
+            let opt_value = core::mem::take(&mut reference.item);
 
             match opt_value {
                 Some(value) => {
@@ -118,6 +129,9 @@ impl<'a, T: Unpin> Future for PutFuture<'a, T> {
                         .mvar
                         .item
                         .with_mut(|ptr| core::mem::swap(unsafe { &mut *ptr }, &mut muvalue));
+
+                    reference.mvar.state.store(MVAR_FULL, Ordering::SeqCst);
+                    reference.mvar.take_waker.wake();
                 }
                 None => {
                     unreachable!("the same PutFuture is used twice");
