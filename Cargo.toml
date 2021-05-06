@@ -1,0 +1,25 @@
+[package]
+name = "async-mvar"
+version = "0.1.0"
+authors = ["Folkert <folkert@folkertdev.nl>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = { version = "0.3.8", default-features = false, features = ["async-await"] }
+
+defmt = "0.2.0"
+defmt-rtt = "0.2.0"
+
+[features]
+default = [
+  "defmt-default", 
+]
+
+defmt-default = []
+defmt-trace = []
+defmt-debug = []
+defmt-info = []
+defmt-warn = []
+defmt-error = []
